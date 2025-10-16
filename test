@@ -1,0 +1,226 @@
+<template>
+  <div class="relative" style="height:420px">
+    <canvas ref="chartCanvas" class="block w-full h-full"></canvas>
+    <!-- 오버레이: 이벤트는 아래 차트로 통과 -->
+    <canvas ref="overlayCanvas" class="pointer-events-none absolute inset-0"></canvas>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import {
+  Chart, ScatterController, PointElement,
+  LinearScale, CategoryScale, Tooltip, Legend
+} from 'chart.js'
+
+Chart.register(ScatterController, PointElement, LinearScale, CategoryScale, Tooltip, Legend)
+
+const chartCanvas = ref(null)
+const overlayCanvas = ref(null)
+let chart, octx, ro, syncRaf = null
+
+// 드래그 상태 (이벤트는 플러그인에서 처리, 렌더는 오버레이에서만)
+const drag = { down:false, started:false, start:{x:0,y:0}, end:{x:0,y:0}, pid:null }
+const THRESH = 6
+
+// ---- 오버레이 사이즈 동기화 ----
+function syncOverlaySize() {
+  if (!overlayCanvas.value) return
+  const rect = overlayCanvas.value.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  overlayCanvas.value.width = Math.max(1, Math.floor(rect.width * dpr))
+  overlayCanvas.value.height = Math.max(1, Math.floor(rect.height * dpr))
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  octx.clearRect(0, 0, overlayCanvas.value.width, overlayCanvas.value.height)
+}
+
+// ---- 오버레이 렌더 (Chart.update() 절대 안 호출) ----
+let overlayRaf = null
+function scheduleOverlayDraw() {
+  if (overlayRaf) return
+  overlayRaf = requestAnimationFrame(() => {
+    overlayRaf = null
+    if (!drag.started) return
+    const A = chart.chartArea
+    const L = Math.min(drag.start.x, drag.end.x)
+    const R = Math.max(drag.start.x, drag.end.x)
+    const T = Math.min(drag.start.y, drag.end.y)
+    const B = Math.max(drag.start.y, drag.end.y)
+
+    octx.clearRect(0, 0, overlayCanvas.value.width, overlayCanvas.value.height)
+    // plot 영역으로만 보이게 클립
+    octx.save()
+    octx.beginPath()
+    octx.rect(A.left, A.top, A.right - A.left, A.bottom - A.top)
+    octx.clip()
+
+    octx.fillStyle = 'rgba(100,149,237,0.12)'
+    octx.strokeStyle = 'rgba(100,149,237,0.85)'
+    octx.lineWidth = 1
+    octx.fillRect(L, T, R - L, B - T)
+    octx.strokeRect(L + 0.5, T + 0.5, (R - L) - 1, (B - T) - 1)
+    octx.restore()
+  })
+}
+
+// ---- 선택 반영: “선택 레이어 dataset” (가벼움) ----
+function ensureSelectionLayer() {
+  const i = chart.data.datasets.findIndex(d => d && d._isSelectionLayer)
+  if (i >= 0) return i
+  chart.data.datasets.push({
+    _isSelectionLayer: true,
+    label: 'Selection',
+    data: [],
+    showLine: false,
+    pointRadius: 6,
+    pointHoverRadius: 6,
+    backgroundColor: '#111827',
+    borderWidth: 0,
+    parsing: false,
+    order: 9999
+  })
+  return chart.data.datasets.length - 1
+}
+
+function selectHitsAndHighlight(box) {
+  const hits = []
+  chart.data.datasets.forEach((ds, di) => {
+    if (ds._isSelectionLayer) return
+    const meta = chart.getDatasetMeta(di)
+    meta.data.forEach((el, idx) => {
+      const x = el.x, y = el.y
+      if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+        hits.push({ datasetIndex: di, index: idx })
+      }
+    })
+  })
+  const selIdx = ensureSelectionLayer()
+  chart.data.datasets[selIdx].data = hits.map(({ datasetIndex, index }) =>
+    chart.data.datasets[datasetIndex].data[index]
+  )
+}
+
+// ---- 드래그 이벤트: Chart 플러그인에서 ‘이벤트만’ 처리 ----
+const DOWN = new Set(['pointerdown','mousedown','touchstart'])
+const MOVE = new Set(['pointermove','mousemove','touchmove'])
+const UP   = new Set(['pointerup','mouseup','touchend','pointercancel','mouseleave'])
+
+const dragPlugin = {
+  id: 'drag-select-overlay',
+  afterEvent(c, args) {
+    const e = args.event, t = e.type
+    // 시작
+    if (DOWN.has(t) && !drag.down) {
+      if (t === 'mousedown' && e.native && e.native.button !== 0) return
+      drag.down = true; drag.started = false
+      drag.start = { x: e.x, y: e.y }
+      drag.end   = drag.start
+      // 포인터 캡처(벗어나도 move 유지)
+      if (e.native?.pointerId != null && c.canvas.setPointerCapture) {
+        drag.pid = e.native.pointerId
+        try { c.canvas.setPointerCapture(drag.pid) } catch {}
+      } else drag.pid = null
+      // 드래그 중 툴팁 비용 제거(선택)
+      if (c.options.plugins?.tooltip) c.options.plugins.tooltip.enabled = false
+      return
+    }
+    // 이동
+    if (MOVE.has(t) && drag.down) {
+      drag.end = { x: e.x, y: e.y }
+      if (!drag.started) {
+        const dx = drag.end.x - drag.start.x, dy = drag.end.y - drag.start.y
+        if (Math.hypot(dx, dy) >= THRESH) drag.started = true
+      }
+      // 오버레이만 그림
+      scheduleOverlayDraw()
+      return
+    }
+    // 종료
+    if (UP.has(t) && drag.down) {
+      drag.down = false
+      octx.clearRect(0, 0, overlayCanvas.value.width, overlayCanvas.value.height)
+
+      if (drag.started) {
+        const box = {
+          left: Math.min(drag.start.x, drag.end.x),
+          right: Math.max(drag.start.x, drag.end.x),
+          top: Math.min(drag.start.y, drag.end.y),
+          bottom: Math.max(drag.start.y, drag.end.y),
+        }
+        selectHitsAndHighlight(box)
+        c.update('none') // mouseup에서 1회만
+      }
+      if (drag.pid != null && c.canvas.releasePointerCapture) {
+        try { c.canvas.releasePointerCapture(drag.pid) } catch {}
+      }
+      drag.pid = null
+      drag.started = false
+      if (c.options.plugins?.tooltip) c.options.plugins.tooltip.enabled = true
+    }
+  }
+}
+
+// ---- 차트 생성 ----
+function makeData() {
+  const labels = Array.from({ length: 80 }, (_, i) => `X${i+1}`)
+  const datasets = ['A','B','C'].map((tag, k) => ({
+    label: `Series ${tag}`,
+    data: labels.map((_, x) => ({ x, y: 10 + Math.random()*80 + k*5 })),
+    showLine: false,
+    pointRadius: 3,
+    parsing: false,
+  }))
+  return { labels, datasets }
+}
+
+async function initChart() {
+  const ctx = chartCanvas.value.getContext('2d')
+  const { labels, datasets } = makeData()
+
+  chart = new Chart(ctx, {
+    type: 'scatter',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      // 드래그와 무관. 툴팁/호버 원하면 켜둬도 되지만 드래그 중엔 비활성됨.
+      interaction: { mode: 'nearest', intersect: false, axis: 'xy' },
+      plugins: { tooltip: { enabled: true }, legend: { display: false } },
+      // 다양한 입력 경로 허용(환경별 이벤트 차단 방지)
+      events: [
+        'pointerdown','pointermove','pointerup','pointercancel',
+        'mousedown','mousemove','mouseup',
+        'touchstart','touchmove','touchend','mouseleave','mouseout','click'
+      ],
+      scales: {
+        x: { type: 'category', ticks: { autoSkip: false } },
+        y: { beginAtZero: true }
+      }
+    },
+    plugins: [dragPlugin]
+  })
+}
+
+onMounted(async () => {
+  await nextTick()
+  octx = overlayCanvas.value.getContext('2d')
+  await initChart()
+  syncOverlaySize()
+  // 부모 리사이즈에 맞춰 오버레이만 동기화 (차트는 responsive=true로 자동)
+  ro = new ResizeObserver(() => {
+    if (syncRaf) cancelAnimationFrame(syncRaf)
+    syncRaf = requestAnimationFrame(syncOverlaySize)
+  })
+  ro.observe(overlayCanvas.value.parentElement)
+})
+
+onBeforeUnmount(() => {
+  ro?.disconnect?.()
+  if (chart) chart.destroy()
+})
+</script>
+
+<style scoped>
+/* 필요시 스타일 조정 */
+</style>
