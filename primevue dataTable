@@ -1,0 +1,75 @@
+<template>
+  <div class="grid grid-cols-2 gap-6">
+    <div>
+      <h3>Table A</h3>
+      <DataTable
+        ref="tableA"
+        :value="rowsA"
+        scrollable
+        scrollHeight="400px"
+      >
+        <Column field="id" header="ID" />
+        <Column field="name" header="Name" />
+        <Column field="value" header="Value" />
+      </DataTable>
+    </div>
+
+    <div>
+      <h3>Table B</h3>
+      <DataTable
+        ref="tableB"
+        :value="rowsB"
+        scrollable
+        scrollHeight="400px"
+      >
+        <Column field="id" header="ID" />
+        <Column field="name" header="Name" />
+        <Column field="value" header="Value" />
+      </DataTable>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, nextTick } from 'vue'
+
+// 예시 데이터
+const rowsA = ref(Array.from({ length: 200 }, (_, i) => ({
+  id: i + 1, name: `A-${i + 1}`, value: Math.random().toFixed(3)
+})))
+const rowsB = ref(Array.from({ length: 200 }, (_, i) => ({
+  id: i + 1, name: `B-${i + 1}`, value: Math.random().toFixed(3)
+})))
+
+// ✅ 핵심: 간단한 동기화 훅
+function useSyncedDataTables(tableRef1, tableRef2) {
+  const attach = () => {
+    const el1 = tableRef1.value?.$el?.querySelector('.p-datatable-wrapper')
+    const el2 = tableRef2.value?.$el?.querySelector('.p-datatable-wrapper')
+    if (!el1 || !el2) return
+
+    let syncing = false
+    const sync = (src, dst) => (e) => {
+      if (syncing) return
+      syncing = true
+      dst.scrollTop = src.scrollTop
+      dst.scrollLeft = src.scrollLeft
+      requestAnimationFrame(() => (syncing = false))
+    }
+
+    el1.addEventListener('scroll', sync(el1, el2))
+    el2.addEventListener('scroll', sync(el2, el1))
+  }
+
+  onMounted(async () => {
+    await nextTick()
+    attach()
+  })
+}
+
+const tableA = ref(null)
+const tableB = ref(null)
+
+// ✅ 한 줄로 스크롤 동기화
+useSyncedDataTables(tableA, tableB)
+</script>
