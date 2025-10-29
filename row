@@ -1,0 +1,54 @@
+/**
+ * row: { step_seq, step_desc, version_1, version_2, ... } 형태의 백엔드 한 건
+ * selected: [1,2,3] 처럼 체크된 버전 리스트
+ * options:
+ *  - red: null 존재 시 비-null 항목에 칠할 색
+ *  - yellow: 값 불일치 시 칠할 색
+ *  - pick: 모두 동일할 때 대표 버전 선택 규칙 ('max' | 'min' | number)
+ */
+function buildVersionParams(
+  row,
+  selected,
+  { red = 'red', yellow = 'yellow', pick = 'max' } = {}
+) {
+  const values = selected.map(n => ({
+    n,
+    key: `version_${n}`,
+    val: Object.prototype.hasOwnProperty.call(row, `version_${n}`) ? row[`version_${n}`] : null
+  }));
+
+  const hasNull = values.some(v => v.val == null);
+  const nonNull = values.filter(v => v.val != null);
+  const distinct = new Set(nonNull.map(v => v.val));
+
+  // 1) 하나라도 null이면: 비-null 항목만, background=red
+  if (hasNull) {
+    const out = {};
+    for (const { n, val } of nonNull) {
+      out[`version${n}`] = { version: val, background: red };
+    }
+    return out;
+  }
+
+  // 2) null은 없고 값이 서로 다르면: 전체, background=yellow
+  if (distinct.size > 1) {
+    const out = {};
+    for (const { n, val } of values) {
+      out[`version${n}`] = { version: val, background: yellow };
+    }
+    return out;
+  }
+
+  // 3) 모두 값 있고 동일하면: 대표 하나만, background 없음
+  const choose = (() => {
+    if (pick === 'max') return Math.max(...selected);
+    if (pick === 'min') return Math.min(...selected);
+    if (typeof pick === 'number' && selected.includes(pick)) return pick;
+    return Math.max(...selected); // 기본 max
+  })();
+
+  const chosen = values.find(v => v.n === choose);
+  return {
+    [`version${choose}`]: { version: chosen?.val ?? null }
+  };
+}
